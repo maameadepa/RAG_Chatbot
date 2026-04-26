@@ -14,6 +14,9 @@ import json
 import logging
 import requests
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()  # loads from .env for local dev
 
 from data_loader    import prepare_all_chunks
 from retriever      import build_retriever, load_retriever, VectorStore
@@ -38,7 +41,7 @@ LOG_PATH      = "logs/query_log.jsonl"
 
 # ── LLM Config ──────────────────────────────────────────────────────────────────
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-MODEL        = "llama3-8b-8192"   # free, fast, very capable
+MODEL        = "llama-3.1-8b-instant"   # llama3-8b-8192 was decommissioned May 2025
 MAX_TOKENS   = 1024
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -62,17 +65,20 @@ class RAGPipeline:
     # INIT
     # ══════════════════════════════════════════════════════════════════════════
 
-    def initialize(self, force_rebuild: bool = False):
+    def initialize(self, force_rebuild: bool = False, on_progress=None):
         """
         Build or load the FAISS index.
-        On first run (or if force_rebuild=True), loads data, chunks, embeds.
-        Subsequent runs load from disk in seconds.
+        on_progress: optional callable(str) for live UI progress updates.
+        On first run builds from scratch; subsequent runs load from disk.
         """
-        logger.info("═" * 60)
-        logger.info("[INIT] Starting RAG Pipeline initialization")
+        def _p(msg):
+            logger.info(msg)
+            if on_progress:
+                on_progress(msg)
 
-        # Check if saved index exists
-        from retriever import INDEX_PATH, CHUNKS_PATH
+        from retriever import (INDEX_PATH, CHUNKS_PATH,
+                                EmbeddingPipeline, VectorStore, HybridRetriever)
+
         index_exists = (
             os.path.exists(INDEX_PATH) and
             os.path.exists(CHUNKS_PATH) and
@@ -80,29 +86,37 @@ class RAGPipeline:
         )
 
         if index_exists:
-            logger.info("[INIT] Loading existing FAISS index from disk")
-            self.retriever = load_retriever()
+            _p("📂 Existing index found — loading from disk…")
+            _p("  → Loading embedding model into memory…")
+            embedder = EmbeddingPipeline()
+            _p("  → Reading FAISS index and chunk cache…")
+            store = VectorStore(dim=embedder.dim)
+            store.load()
+            self.retriever = HybridRetriever(store, embedder)
         else:
-            logger.info("[INIT] Building new index from source documents")
+            _p("🔨 No index found — building from scratch…")
+            _p("🧠 Step 1/3 — Loading embedding model…")
+            _p("   (First run: may download ~80 MB from HuggingFace — please wait)")
+            embedder = EmbeddingPipeline()
+            _p(f"   ✓ Model loaded  ({embedder.dim}-dim embeddings)")
 
-            # Step 1: Load + chunk data
-            logger.info("[INIT] Step 1/3 — Loading and chunking documents")
+            _p("📄 Step 2/3 — Loading & chunking documents…")
             chunks = prepare_all_chunks(CSV_PATH, PDF_PATH, chunking_strategy="sentence")
-            logger.info(f"[INIT] Total chunks: {len(chunks)}")
+            _p(f"   ✓ {len(chunks)} chunks created")
 
-            # Step 2: Embed + index
-            logger.info("[INIT] Step 2/3 — Embedding chunks and building FAISS index")
-            self.retriever, build_logs = build_retriever(chunks)
-            for log in build_logs:
-                logger.info(log)
+            _p(f"⚡ Step 3/3 — Embedding {len(chunks)} chunks & building FAISS index…")
+            _p("   (This takes 1-3 min on first run — index is cached after this)")
+            store = VectorStore(dim=embedder.dim)
+            store.add_chunks(chunks, embedder)
+            store.save()
+            self.retriever = HybridRetriever(store, embedder)
+            _p("   ✓ FAISS index built and saved to disk")
 
-            # Step 3: Integrate feedback memory
-            logger.info("[INIT] Step 3/3 — Loading feedback memory")
+            _p("💾 Loading feedback memory…")
             self._load_feedback_memory()
 
         self.ready = True
-        logger.info("[INIT] Pipeline ready ✓")
-        logger.info("═" * 60)
+        _p("✅ Pipeline ready!")
 
     # ══════════════════════════════════════════════════════════════════════════
     # QUERY
@@ -183,17 +197,22 @@ class RAGPipeline:
         Direct HTTP call to Anthropic API.
         No SDK — raw requests only (satisfies the 'no pre-built pipeline' constraint).
         """
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        # Read from Streamlit secrets (cloud) or .env (local)
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("GROQ_API_KEY", "") or os.environ.get("GROQ_API_KEY", "")
+        except Exception:
+            api_key = os.environ.get("GROQ_API_KEY", "")
+
         if not api_key:
             return (
-                "⚠️ ANTHROPIC_API_KEY not set. "
-                "Set it in your environment: export ANTHROPIC_API_KEY=sk-ant-..."
+                "⚠️ GROQ_API_KEY not set. "
+                "Add it to .streamlit/secrets.toml locally, or via the Streamlit Cloud dashboard."
             )
 
         headers = {
-            "x-api-key":         api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type":      "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type":  "application/json",
         }
         payload = {
             "model":      MODEL,
@@ -203,14 +222,14 @@ class RAGPipeline:
 
         try:
             resp = requests.post(
-                ANTHROPIC_API_URL,
+                GROQ_API_URL,
                 headers=headers,
                 json=payload,
                 timeout=30
             )
             resp.raise_for_status()
             data   = resp.json()
-            answer = data["content"][0]["text"].strip()
+            answer = data["choices"][0]["message"]["content"].strip()
             return answer
 
         except requests.exceptions.Timeout:

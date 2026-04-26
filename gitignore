@@ -1,0 +1,27 @@
+# ── Secrets — NEVER commit these ──
+.env
+.streamlit/secrets.toml
+
+# ── Auto-generated index files (commit these AFTER building locally) ──
+# data/faiss.index   ← remove this comment to ALSO ignore the index
+# data/chunks.pkl    ← remove this comment to ALSO ignore chunks
+
+# ── Logs ──
+logs/query_log.jsonl
+logs/pipeline.log
+logs/feedback.json
+logs/adversarial_results.json
+
+# ── Python cache ──
+__pycache__/
+*.pyc
+*.pyo
+
+# ── OS files ──
+.DS_Store
+Thumbs.db
+
+# ── Virtual environments ──
+venv/
+env/
+.venv/
